@@ -106,6 +106,38 @@
             box-shadow: 0 6px 16px rgba(0, 166, 233, 0.4);
         }
 
+        .add-photo-btn {
+            display: none;
+            position: absolute;
+            right: 12px;
+            bottom: 12px;
+            min-height: 42px;
+            border: none;
+            border-radius: 999px;
+            background: linear-gradient(135deg, #00A6E9 0%, #004B88 100%);
+            color: #fff;
+            font-size: 13px;
+            font-weight: 700;
+            line-height: 1;
+            padding: 0 14px;
+            cursor: pointer;
+            z-index: 20;
+            box-shadow: 0 4px 12px rgba(0, 166, 233, 0.35);
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            white-space: nowrap;
+        }
+
+        .add-photo-icon {
+            font-size: 20px;
+            line-height: 1;
+        }
+
+        .add-photo-btn:hover {
+            transform: scale(1.08);
+        }
+
         /* Carousel Styles */
         .carousel-container {
             position: relative;
@@ -259,14 +291,48 @@
         }
         .error-msg.visible { display: block; }
 
+        .upload-progress {
+            display: none;
+            margin: 8px 0 14px;
+            width: 100%;
+        }
+
+        .upload-progress.visible {
+            display: block;
+        }
+
+        .upload-progress-label {
+            color: #1D174F;
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+
+        .upload-progress-track {
+            width: 100%;
+            height: 10px;
+            background: #dbe9f5;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .upload-progress-fill {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #00A6E9 0%, #004B88 100%);
+            transition: width 0.2s ease;
+        }
+
         /* View-only mode — no delete, no add, no thumbnails strip actions */
         body.view-only .btn-delete { display: none; }
         body.view-only .thumbnails { background: transparent; }
+        body.view-only .add-photo-btn { display: none !important; }
 
         /* Static/table mode — single image, compact */
         body.static-mode .carousel-container { height: 160px; }
         body.static-mode .thumbnails { display: none; }
         body.static-mode .btn-delete { display: none; }
+        body.static-mode .add-photo-btn { display: none !important; }
 
         #carousel { height: auto !important;  }
 
@@ -342,6 +408,13 @@
         </div>
 
         <div class="error-msg" id="error-msg"></div>
+        <div class="upload-progress" id="upload-progress">
+            <div class="upload-progress-label" id="upload-progress-label">Uploading 0%</div>
+            <div class="upload-progress-track">
+                <div class="upload-progress-fill" id="upload-progress-fill"></div>
+            </div>
+        </div>
+        <div id="debug"></div>
 
         <!-- Spinner Overlay -->
         <div id="spinner-overlay" class="active">
@@ -356,17 +429,63 @@
             <div class="carousel-track" id="track"></div>
         </div>
 
+        <button id="add-photo-btn" class="add-photo-btn" type="button" title="Add photo" aria-label="Add Photo">
+            <span class="add-photo-icon">+</span>
+            <span>Add Photo</span>
+        </button>
+
         <!-- Thumbnails -->
         <div class="thumbnails" id="thumbnails"></div>
     </div>
 
     <script>
+        let enableDebug = false;
         let uploadedImages = [];
         let currentSlide = 0;
         let isRequired = false;
         let modalCurrentIndex = 0;
         let uploadServerURL = '';
         let uploadFolder = '';
+        let allowSubmissionEditUpload = false;
+
+        function showUploadProgress() {
+            document.getElementById('upload-progress').classList.add('visible');
+        }
+
+        function hideUploadProgress() {
+            document.getElementById('upload-progress').classList.remove('visible');
+        }
+
+        function setUploadProgress(percent, completed, total) {
+            var safePercent = Math.max(0, Math.min(100, Math.round(percent || 0)));
+            var fill = document.getElementById('upload-progress-fill');
+            var label = document.getElementById('upload-progress-label');
+
+            fill.style.width = safePercent + '%';
+            if (typeof completed === 'number' && typeof total === 'number') {
+                label.textContent = 'Uploading ' + safePercent + '% (' + completed + '/' + total + ')';
+            } else {
+                label.textContent = 'Uploading ' + safePercent + '%';
+            }
+        }
+
+        function getRoleFromData(data) {
+            var candidates = [
+                data && data.sid,
+                data && data.editLink,
+                window.location.search
+            ];
+
+            for (var i = 0; i < candidates.length; i++) {
+                var text = String(candidates[i] || '').toLowerCase();
+                if (!text) continue;
+                if (text.indexOf('?technician') !== -1 || text.indexOf('&technician') !== -1) return 'technician';
+                if (text.indexOf('?reviewer') !== -1 || text.indexOf('&reviewer') !== -1) return 'reviewer';
+                if (text.indexOf('?client') !== -1 || text.indexOf('&client') !== -1) return 'client';
+            }
+
+            return '';
+        }
 
         // Widget Settings Configuration
         let widgetSettings = {
@@ -394,42 +513,111 @@
         function buildMetadataValue() {
             if (uploadedImages.length === 0) return '';
             return JFCustomWidgetUtils.buildMetadata('imagelinks', uploadedImages.map(function (img) {
+                if (img.url) {
+                    return { name: img.name, url: JFCustomWidgetUtils.getS3UriRelativePath(img.url) || img.url };
+                }
                 var isDataUri = img.base64 && img.base64.indexOf('data:') === 0;
                 if (isDataUri) {
                     return { name: img.name, base64: img.base64 };
-                } else {
-                    return { name: img.name, url: JFCustomWidgetUtils.getS3UriRelativePath(img.base64) };
                 }
+                return { name: img.name, url: JFCustomWidgetUtils.getS3UriRelativePath(img.base64) };
             }));
         }
 
+        function restorePersistedImages(items, done) {
+            uploadedImages = (items || []).map(function (item) {
+                return {
+                    name: item.name,
+                    url: item.url || '',
+                    base64: (item.base64 && item.base64.indexOf('data:') === 0) ? item.base64 : ''
+                };
+            }).filter(function (img) {
+                return img.base64 || img.url;
+            });
+
+            if (uploadedImages.length === 0) {
+                if (typeof done === 'function') done();
+                return;
+            }
+
+            var pending = uploadedImages.length;
+            function settle() {
+                pending -= 1;
+                if (pending > 0) return;
+                currentSlide = 0;
+                updateCarousel();
+                if (typeof done === 'function') done();
+            }
+
+            uploadedImages.forEach(function (img) {
+                if (img.base64) {
+                    settle();
+                    return;
+                }
+
+                var persistUrl = img.url;
+                if (typeof JFCustomWidget.loadProtectedImage !== 'function') {
+                    console.error('[carousel] JFCustomWidget.loadProtectedImage missing. Form is not on a for-custom-widgets build that includes this API.');
+                    settle();
+                    return;
+                }
+
+                JFCustomWidget.loadProtectedImage(persistUrl).then(function (base64) {
+                    img.base64 = base64;
+                    settle();
+                }).catch(function (error) {
+                    console.error('[carousel] loadProtectedImage failed', persistUrl, error);
+                    settle();
+                });
+            });
+        }
+
         // Upload file to Jotform server
-        function uploadToJotform(file, callback) {
+        function uploadToJotform(file, callback, onProgress) {
             var origin = uploadServerURL.replace('/upload', '');
             var url = origin + '/server.php?action=handleWidgetFiles&type=save';
 
             var formData = new FormData();
             formData.append('file', file, file.name);
 
-            fetch(url, {
-                method: 'POST',
-                body: formData
-            })
-            .then(function (res) { return res.json(); })
-            .then(function (response) {
-                console.log('[uploadToJotform] response:', JSON.stringify(response));
-                if (response && response.success && response.message) {
-                    callback(response.message);
-                } else {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', url, true);
+
+            xhr.upload.onprogress = function (e) {
+                if (e.lengthComputable && typeof onProgress === 'function') {
+                    onProgress((e.loaded / e.total) * 100);
+                }
+            };
+
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState !== 4) return;
+                try {
+                    var response = JSON.parse(xhr.responseText || '{}');
+                    console.log('[uploadToJotform] response:', JSON.stringify(response));
+                    if (response && response.success && response.message) {
+                        callback(response.message);
+                    } else {
+                        callback(null);
+                    }
+                } catch (e) {
                     callback(null);
                 }
-            })
-            .catch(function () { callback(null); });
+            };
+
+            xhr.onerror = function () { callback(null); };
+            xhr.send(formData);
         }
 
         // Read file as base64
-        function readAsBase64(file, onDone) {
+        function readAsBase64(file, onDone, onProgress) {
             var reader = new FileReader();
+
+            reader.onprogress = function (e) {
+                if (e.lengthComputable && typeof onProgress === 'function') {
+                    onProgress((e.loaded / e.total) * 100);
+                }
+            };
+
             reader.onload = function (e) {
                 onDone(e.target.result);
             };
@@ -681,34 +869,71 @@
                 return;
             }
 
+            var fileProgress = new Array(imageFiles.length).fill(0);
             var processed = 0;
+
+            showUploadProgress();
+            setUploadProgress(0, 0, imageFiles.length);
+
+            function refreshOverallProgress() {
+                var totalPercent = fileProgress.reduce(function (sum, p) { return sum + p; }, 0);
+                var averagePercent = totalPercent / imageFiles.length;
+                setUploadProgress(averagePercent, processed, imageFiles.length);
+            }
+
+            function updateFileProgress(index, percent) {
+                fileProgress[index] = Math.max(fileProgress[index], percent || 0);
+                refreshOverallProgress();
+            }
 
             function onImageReady() {
                 processed++;
+                setUploadProgress((processed / imageFiles.length) * 100, processed, imageFiles.length);
                 if (processed === imageFiles.length) {
+                    setUploadProgress(100, processed, imageFiles.length);
+                    setTimeout(function () { hideUploadProgress(); }, 400);
                     currentSlide = uploadedImages.length - 1;
                     updateCarousel();
                     sendCurrentValue();
                 }
             }
 
-            imageFiles.forEach(function (file) {
+            imageFiles.forEach(function (file, index) {
                 if (uploadServerURL && uploadFolder) {
                     uploadToJotform(file, function (url) {
                         if (url) {
-                            uploadedImages.push({ name: file.name, base64: url });
-                            onImageReady();
+                            updateFileProgress(index, 100);
+                            var uploaded = {
+                                name: file.name,
+                                url: JFCustomWidgetUtils.getS3UriRelativePath(url) || url,
+                                base64: ''
+                            };
+                            uploadedImages.push(uploaded);
+                            readAsBase64(file, function (dataUri) {
+                                uploaded.base64 = dataUri;
+                                onImageReady();
+                            }, function (percent) {
+                                updateFileProgress(index, percent);
+                            });
                         } else {
                             readAsBase64(file, function (dataUri) {
+                                updateFileProgress(index, 100);
                                 uploadedImages.push({ name: file.name, base64: dataUri });
                                 onImageReady();
+                            }, function (percent) {
+                                updateFileProgress(index, percent);
                             });
                         }
+                    }, function (percent) {
+                        updateFileProgress(index, percent);
                     });
                 } else {
                     readAsBase64(file, function (dataUri) {
+                        updateFileProgress(index, 100);
                         uploadedImages.push({ name: file.name, base64: dataUri });
                         onImageReady();
+                    }, function (percent) {
+                        updateFileProgress(index, percent);
                     });
                 }
             });
@@ -720,27 +945,35 @@
             const track = document.getElementById('track');
             const thumbsContainer = document.getElementById('thumbnails');
             const dropZone = document.getElementById('drop-zone');
+            const addPhotoBtn = document.getElementById('add-photo-btn');
 
-            // document.getElementById('debugger').textContent = 'Images in carousel: ' + uploadedImages.length;
+            if(enableDebug){
+                document.getElementById('debug').textContent = 'Images in carousel: ' + uploadedImages.length;
+            }
             
             if (uploadedImages.length == 0) {
                 carousel.style.display = 'none';
-                dropZone.style.display = 'block';
+                addPhotoBtn.style.display = 'none';
 
                 //Hide if there are no images and we're in view-only mode (e.g. tables/submission view)
                 if(document.body.classList.contains('view-only')) {
                     dropZone.style.display = 'none';
+                } else {
+                    dropZone.style.display = 'block';
                 }
 
                 thumbsContainer.innerHTML = '';
                 hideSpinner();
-                // document.getElementById('debugger').textContent = 'No images uploaded, showing drop zone.';
+                if(enableDebug){
+                    document.getElementById('debug').textContent = 'No images uploaded, showing drop zone.';
+                }
                 requestResize();
                 return;
             }
 
             dropZone.style.display = 'none';
             carousel.style.display = 'block';
+            addPhotoBtn.style.display = document.body.classList.contains('view-only') ? 'none' : 'flex';
             
             if (currentSlide >= uploadedImages.length) {
                 currentSlide = Math.max(0, uploadedImages.length - 1);
@@ -832,6 +1065,11 @@
         // File input handling
         const fileInput = document.getElementById('file-input');
         const dropZone = document.getElementById('drop-zone');
+        const addPhotoBtn = document.getElementById('add-photo-btn');
+
+        addPhotoBtn.addEventListener('click', function () {
+            fileInput.click();
+        });
 
         fileInput.addEventListener('change', function (e) {
             if (e.target.files.length) processFiles(e.target.files);
@@ -863,6 +1101,35 @@
 
             // Static mode — widget is being viewed in tables/submission view
             var isStatic = JFCustomWidget.isWidgetStatic();
+            var userRole = getRoleFromData(data);
+            var isTechnicianSession = userRole === 'technician';
+            var isReviewerSession = userRole === 'reviewer';
+
+            //Output debug info if enabled
+            if(enableDebug){
+                var dataDebugLines = Object.keys(data || {}).map(function (key) {
+                    var value = data[key];
+                    if (value === undefined) return key + ': undefined';
+                    if (value === null) return key + ': null';
+                    if (typeof value === 'object') {
+                        try {
+                            return key + ': ' + JSON.stringify(value);
+                        } catch (e) {
+                            return key + ': [object]';
+                        }
+                    }
+                    return key + ': ' + String(value);
+                });
+
+                document.getElementById('debug').innerHTML =
+                    'isStatic: ' + isStatic +
+                    '<br>isEditMode: ' + data.isEditMode +
+                    '<br>userRole: ' + (userRole || '(none)') +
+                    '<br>value length: ' + (data.value ? data.value.length : 0) +
+                    '<br>editLink: ' + (data.editLink || false) +
+                    '<br><br><strong>All data properties:</strong><br>' +
+                    (dataDebugLines.length ? dataDebugLines.join('<br>') : '(no properties)');
+            }
 
             // Edit mode — form loaded with an existing submission value
             var isEditMode = data.isEditMode || (data.value && data.value.length > 0);
@@ -881,15 +1148,18 @@
             // Apply widget settings
             applyWidgetSettings();
 
+            // Default-deny in edit mode unless role is explicitly technician.
+            allowSubmissionEditUpload = isEditMode && !isStatic && (isTechnicianSession || isReviewerSession);
+
             if (isStatic) {
                 document.body.classList.add('static-mode', 'view-only');
-            } else if (isEditMode) {
+            } else if (!allowSubmissionEditUpload && isEditMode) {
                 document.body.classList.add('view-only');
             }
 
             // Hide upload element when editLink is present
             var editLink = data.editLink || false;
-            if (editLink) {
+            if (editLink && !allowSubmissionEditUpload) {
                 document.getElementById('drop-zone').style.display = 'none';
             }
 
@@ -897,15 +1167,9 @@
             if (data.value && JFCustomWidgetUtils.hasMetadata(data.value)) {
                 var extracted = JFCustomWidgetUtils.extractMetadata(data.value);
                 if (extracted && extracted.length > 0) {
-                    uploadedImages = extracted.map(function (item) {
-                        var src = item.base64 || '';
-                        if (!src && item.url) {
-                            src = JFCustomWidgetUtils.fixS3UriOrigin(item.url);
-                        }
-                        return { name: item.name, base64: src };
-                    }).filter(function (img) { return !!img.base64; });
-                    currentSlide = 0;
-                    if (uploadedImages.length > 0) updateCarousel();
+                    restorePersistedImages(extracted);
+                } else {
+                    updateCarousel();
                 }
             } else {
                 updateCarousel();
